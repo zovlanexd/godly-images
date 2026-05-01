@@ -1,0 +1,45 @@
+$localAppData = $env:LOCALAPPDATA
+$appData = $env:APPDATA
+
+$paths = @(
+    "$appData\Discord\Local Storage\leveldb",
+    "$appData\discordcanary\Local Storage\leveldb",
+    "$appData\discordptb\Local Storage\leveldb",
+    "$localAppData\Discord\Local Storage\leveldb",
+    "$localAppData\discordcanary\Local Storage\leveldb",
+    "$localAppData\discordptb\Local Storage\leveldb"
+)
+
+$tokenRegex = [regex]'(mfa\.[a-zA-Z0-9_-]{84}|[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}|[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{38,})'
+
+$found = @{}
+
+foreach ($path in $paths) {
+    if (-not (Test-Path $path)) { continue }
+    Get-ChildItem -Path $path -Include "*.ldb","*.log" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $content = [System.IO.File]::ReadAllText($_.FullName)
+            $matches = $tokenRegex.Matches($content)
+            foreach ($match in $matches) {
+                $token = $match.Value
+                if (-not $found.ContainsKey($token)) {
+                    $found[$token] = $_.FullName
+                }
+            }
+        } catch {}
+    }
+}
+
+if ($found.Count -eq 0) {
+    Write-Host "`nNo tokens found." -ForegroundColor Red
+} else {
+    Write-Host "`nFound $($found.Count) token(s):`n" -ForegroundColor Green
+    $i = 1
+    foreach ($token in $found.Keys) {
+        Write-Host "[$i] $token" -ForegroundColor Cyan
+        $i++
+    }
+}
+
+Write-Host "`nPress any key to exit..."
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
