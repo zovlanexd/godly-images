@@ -1,0 +1,449 @@
+/**
+ * @name Local message (preview)
+ * @version 1.1.0
+ * @description Inject messages only on your client (local). For UI/embed testing. Not sent to Discord servers.
+ * @author shufflekillsdream_sodfsdf
+ */
+
+module.exports = class LocalMessagePreview {
+  constructor(meta) {
+    this.meta = meta;
+    this._id = "LocalMessagePreview";
+    this._fallbackTimer = null;
+    this._connUnsub = null;
+    this._autoReplayedThisSession = false;
+  }
+
+  load() {
+    this._data = BdApi.Data.load(this._id) || {};
+    this._ensureData();
+  }
+
+  _ensureData() {
+    const d = this._data;
+    if (typeof d.channelId !== "string") d.channelId = "";
+    if (typeof d.userId !== "string") d.userId = "";
+    if (typeof d.message !== "string") d.message = "";
+    if (typeof d.showEmbedPreview !== "boolean") d.showEmbedPreview = false;
+    if (typeof d.embedImageUrl !== "string") d.embedImageUrl = "";
+    if (typeof d.autoReplayOnLoad !== "boolean") d.autoReplayOnLoad = true;
+    if (!Array.isArray(d.cached)) d.cached = [];
+  }
+
+  /** Keep only JSON-safe data so BdApi.Data.save always persists reliably. */
+  _cloneForStorage(message) {
+    try {
+      return JSON.parse(JSON.stringify(message));
+    } catch {
+      return null;
+    }
+  }
+
+  _save() {
+    BdApi.Data.save(this._id, this._data);
+  }
+
+  _getDispatcher() {
+    const { getModule, Filters } = BdApi.Webpack;
+    const byKeys = Filters.byKeys?.bind(Filters);
+    const byProps = Filters.byProps?.bind(Filters);
+    let m =
+      (byKeys && getModule(byKeys("dispatch", "subscribe"), { searchExports: true })) ||
+      (byProps && getModule(byProps("dispatch", "subscribe"), { searchExports: true })) ||
+      getModule(
+        (x) =>
+          x &&
+          typeof x.dispatch === "function" &&
+          typeof x.subscribe === "function" &&
+          x.wait,
+        { searchExports: true }
+      );
+    if (!m) throw new Error("Could not find Flux dispatcher.");
+    return m;
+  }
+
+  _getChannelStore() {
+    const { getModule, Filters } = BdApi.Webpack;
+    if (Filters.byStoreName) {
+      const s = getModule(Filters.byStoreName("ChannelStore"));
+      if (s?.getChannel) return s;
+    }
+    return getModule(
+      (x) => x?.getChannel && (x.getDMFromUserId || x.getBasicChannel),
+      { searchExports: true }
+    );
+  }
+
+  _getUserStore() {
+    const { getModule, Filters } = BdApi.Webpack;
+    if (Filters.byStoreName) {
+      const s = getModule(Filters.byStoreName("UserStore"));
+      if (s?.getUser) return s;
+    }
+    return getModule((x) => x?.getUser && x?.getCurrentUser, { searchExports: true });
+  }
+
+  _genSnowflake() {
+    const ts = BigInt(Date.now());
+    const rand = BigInt(Math.floor(Math.random() * 0xfffff));
+    return String((ts << 22n) + rand);
+  }
+
+  _buildPayload() {
+    this._ensureData();
+    const d = this._data;
+    const channelId = d.channelId.trim();
+    const userId = d.userId.trim();
+    if (!channelId || !userId) throw new Error("Set both channel ID and user ID.");
+
+    const ChannelStore = this._getChannelStore();
+    const UserStore = this._getUserStore();
+    if (!ChannelStore?.getChannel) throw new Error("Channel store not found.");
+    if (!UserStore?.getUser) throw new Error("User store not found.");
+
+    const channel = ChannelStore.getChannel(channelId);
+    const guildId = channel?.guild_id ?? null;
+
+    const cachedUser = UserStore.getUser(userId);
+    const author = cachedUser
+      ? { ...cachedUser }
+      : {
+          id: userId,
+          username: "unknown-user",
+          discriminator: "0",
+          avatar: null,
+          bot: false,
+          global_name: "Unknown user",
+        };
+
+    const messageId = this._genSnowflake();
+    const now = new Date().toISOString();
+    const text = d.message ?? "";
+
+    const embeds =
+      d.showEmbedPreview && text.trim().length > 0
+        ? [
+            {
+              type: "rich",
+              description: text,
+              ...(d.embedImageUrl?.trim()
+                ? {
+                    image: {
+                      url: d.embedImageUrl.trim(),
+                      proxy_url: d.embedImageUrl.trim(),
+                      width: 400,
+                      height: 300,
+                    },
+                  }
+                : {}),
+            },
+          ]
+        : [];
+
+    const message = {
+      id: messageId,
+      type: 0,
+      content: d.showEmbedPreview ? "" : text,
+      channel_id: channelId,
+      guild_id: guildId,
+      attachments: [],
+      embeds,
+      mentions: [],
+      mention_roles: [],
+      mention_channels: [],
+      mention_everyone: false,
+      pinned: false,
+      tts: false,
+      nonce: messageId,
+      blocked: false,
+      ignored: false,
+      flags: 0,
+      reactions: [],
+      author,
+      timestamp: now,
+      edited_timestamp: null,
+      state: "SENT",
+    };
+
+    return {
+      type: "MESSAGE_CREATE",
+      channelId,
+      guildId,
+      message,
+      optimistic: false,
+      isPushNotification: false,
+    };
+  }
+
+  _toast(msg, type = "error") {
+    try {
+      BdApi.UI.showToast(String(msg), { type });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  _send() {
+    try {
+      const payload = this._buildPayload();
+      this._getDispatcher().dispatch(payload);
+      const stored = this._cloneForStorage(payload.message);
+      if (stored) this._data.cached.push(stored);
+      this._save();
+      this._toast("Local message injected.", "success");
+    } catch (e) {
+      this._toast(e?.message || e);
+    }
+  }
+
+  _replay(showToast = true) {
+    try {
+      this._ensureData();
+      const disp = this._getDispatcher();
+      for (const msg of this._data.cached) {
+        const cid = String(msg.channel_id || "");
+        if (!cid) continue;
+        disp.dispatch({
+          type: "MESSAGE_CREATE",
+          channelId: cid,
+          message: msg,
+          optimistic: false,
+          isPushNotification: false,
+        });
+      }
+      if (showToast) this._toast("Replayed cached messages.", "success");
+    } catch (e) {
+      if (showToast) this._toast(e?.message || e);
+    }
+  }
+
+  _scheduleAutoReplay() {
+    this._autoReplayedThisSession = false;
+    if (this._fallbackTimer) {
+      clearTimeout(this._fallbackTimer);
+      this._fallbackTimer = null;
+    }
+    if (typeof this._connUnsub === "function") {
+      this._connUnsub();
+      this._connUnsub = null;
+    }
+
+    const run = () => {
+      if (this._autoReplayedThisSession) return;
+      this._ensureData();
+      if (!this._data.autoReplayOnLoad || !this._data.cached?.length) return;
+      this._autoReplayedThisSession = true;
+      if (this._fallbackTimer) {
+        clearTimeout(this._fallbackTimer);
+        this._fallbackTimer = null;
+      }
+      try {
+        this._replay(false);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    this._fallbackTimer = setTimeout(run, 6000);
+
+    try {
+      const disp = this._getDispatcher();
+      if (typeof disp.subscribe === "function") {
+        const handler = () => setTimeout(run, 2000);
+        const ret = disp.subscribe("CONNECTION_OPEN", handler);
+        if (typeof ret === "function") {
+          this._connUnsub = ret;
+        } else {
+          this._connUnsub = () => {
+            try {
+              disp.unsubscribe?.("CONNECTION_OPEN", handler);
+            } catch {
+              /* ignore */
+            }
+          };
+        }
+      }
+    } catch {
+      /* dispatcher not ready yet; timer still runs */
+    }
+  }
+
+  _clear() {
+    this._data.cached = [];
+    this._save();
+    this._toast("Cleared cache.", "success");
+  }
+
+  getSettingsPanel() {
+    const React = BdApi.React;
+    const plugin = this;
+
+    const labelStyle = { display: "block", marginBottom: 6, fontSize: 12, color: "var(--header-secondary)" };
+    const inputStyle = {
+      width: "100%",
+      boxSizing: "border-box",
+      padding: 10,
+      marginBottom: 12,
+      borderRadius: 4,
+      border: "1px solid var(--input-border)",
+      background: "var(--input-background)",
+      color: "var(--text-normal)",
+    };
+    const btn = (text, onClick, bg) =>
+      React.createElement(
+        "button",
+        {
+          type: "button",
+          onClick,
+          style: {
+            width: "100%",
+            padding: "10px 12px",
+            marginBottom: 8,
+            borderRadius: 4,
+            border: "none",
+            cursor: "pointer",
+            fontWeight: 600,
+            color: "#fff",
+            background: bg || "var(--button-filled-brand-background)",
+          },
+        },
+        text
+      );
+
+    class Panel extends React.Component {
+      constructor(props) {
+        super(props);
+        plugin._ensureData();
+        const d = plugin._data;
+        this.state = {
+          channelId: d.channelId,
+          userId: d.userId,
+          message: d.message,
+          showEmbedPreview: d.showEmbedPreview,
+          embedImageUrl: d.embedImageUrl,
+          autoReplayOnLoad: d.autoReplayOnLoad,
+        };
+      }
+
+      _sync() {
+        Object.assign(plugin._data, this.state);
+        plugin._save();
+      }
+
+      render() {
+        const s = this.state;
+        const set = (k) => (e) => {
+          const v = e.target.type === "checkbox" ? e.target.checked : e.target.value;
+          this.setState({ [k]: v }, () => this._sync());
+        };
+
+        return React.createElement(
+          "div",
+          { style: { padding: "8px 4px", maxWidth: 480 } },
+          React.createElement("h2", { style: { marginTop: 0 } }, "Send local message"),
+          React.createElement("label", { style: labelStyle }, "Target channel ID"),
+          React.createElement("input", {
+            style: inputStyle,
+            value: s.channelId,
+            placeholder: "Channel snowflake",
+            onChange: set("channelId"),
+          }),
+          React.createElement("label", { style: labelStyle }, "Target user ID"),
+          React.createElement("input", {
+            style: inputStyle,
+            value: s.userId,
+            placeholder: "User snowflake (author shown in UI)",
+            onChange: set("userId"),
+          }),
+          React.createElement("label", { style: labelStyle }, "Message content"),
+          React.createElement("textarea", {
+            style: { ...inputStyle, minHeight: 88, resize: "vertical" },
+            value: s.message,
+            placeholder: "Text (or embed body if preview is on)",
+            onChange: set("message"),
+          }),
+          React.createElement(
+            "label",
+            { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 12 } },
+            React.createElement("input", {
+              type: "checkbox",
+              checked: s.showEmbedPreview,
+              onChange: set("showEmbedPreview"),
+            }),
+            React.createElement("span", null, "Show embed preview")
+          ),
+          React.createElement(
+            "label",
+            { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 12 } },
+            React.createElement("input", {
+              type: "checkbox",
+              checked: s.autoReplayOnLoad,
+              onChange: set("autoReplayOnLoad"),
+            }),
+            React.createElement("span", null, "Auto-replay saved messages after Discord loads")
+          ),
+          React.createElement(
+            "p",
+            { style: { fontSize: 12, color: "var(--text-muted)", marginBottom: 12 } },
+            `Saved locally: ${plugin._data.cached?.length ?? 0} message(s). BetterDiscord stores this in plugin data on disk (persists across restarts).`
+          ),
+          React.createElement("label", { style: labelStyle }, "Embed image URL"),
+          React.createElement("input", {
+            style: inputStyle,
+            value: s.embedImageUrl,
+            placeholder: "Main image for the embed",
+            onChange: set("embedImageUrl"),
+          }),
+          React.createElement(
+            "p",
+            { style: { fontSize: 12, color: "var(--text-muted)", marginBottom: 12 } },
+            "Embeds are hidden while the checkbox is off. Messages are plain text. Local only — not sent to Discord."
+          ),
+          btn("Send message", () => {
+            plugin._send();
+            this.forceUpdate();
+          }),
+          btn(
+            "Replay cached local messages",
+            () => {
+              plugin._replay(true);
+              this.forceUpdate();
+            },
+            "var(--background-secondary)"
+          ),
+          btn(
+            "Clear cached local messages",
+            () => {
+              plugin._clear();
+              this.forceUpdate();
+            },
+            "#ed4245"
+          ),
+          React.createElement(
+            "p",
+            { style: { fontSize: 12, color: "var(--text-muted)" } },
+            "Open the target channel before sending so the message appears in that view."
+          )
+        );
+      }
+    }
+
+    return React.createElement(Panel, null);
+  }
+
+  start() {
+    this._ensureData();
+    this._scheduleAutoReplay();
+  }
+
+  stop() {
+    if (this._fallbackTimer) {
+      clearTimeout(this._fallbackTimer);
+      this._fallbackTimer = null;
+    }
+    if (typeof this._connUnsub === "function") {
+      this._connUnsub();
+      this._connUnsub = null;
+    }
+  }
+};
